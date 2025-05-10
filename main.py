@@ -347,7 +347,7 @@ class ImageMatcherApp:
         # Create a figure with two subplots
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
 
-        # Plot processing time
+        # Plot  processing time
         methods = performance_data['Method']
         times = performance_data['Time (s)']
         ax1.bar(methods, times)
