@@ -9,8 +9,11 @@ import gc
 import sys
 import importlib
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import partial
+import cv2
+from pathlib import Path
+
+# Suppress OpenCV warnings
+cv2.setLogLevel(0)
 
 # Ensure ImageBind is in path
 imagebind_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "imagebind")
@@ -18,10 +21,110 @@ if imagebind_dir not in sys.path:
     sys.path.insert(0, imagebind_dir)
 
 
+def safe_image_open(image_path):
+    """
+    Safely open an image file handling Unicode paths and various formats.
+    """
+    try:
+        # Method 1: Try PIL directly (works well with Unicode)
+        image = Image.open(image_path).convert("RGB")
+        return image
+    except Exception as pil_error:
+        try:
+            # Method 2: Try using pathlib for better Unicode handling
+            path_obj = Path(image_path)
+            if path_obj.exists():
+                image = Image.open(path_obj).convert("RGB")
+                return image
+        except Exception as pathlib_error:
+            try:
+                # Method 3: Try OpenCV with Unicode support then convert to PIL
+                # Use cv2.IMREAD_COLOR and handle Unicode paths
+                import cv2
+
+                # For Windows Unicode support, read as binary first
+                if os.name == 'nt':  # Windows
+                    # Use numpy to read file with Unicode support
+                    with open(image_path, 'rb') as f:
+                        image_data = f.read()
+
+                    # Convert to numpy array and decode with OpenCV
+                    nparr = np.frombuffer(image_data, np.uint8)
+                    cv_image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+                    if cv_image is not None:
+                        # Convert BGR to RGB and then to PIL
+                        cv_image_rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+                        image = Image.fromarray(cv_image_rgb)
+                        return image
+                else:
+                    # For non-Windows systems
+                    cv_image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+                    if cv_image is not None:
+                        cv_image_rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+                        image = Image.fromarray(cv_image_rgb)
+                        return image
+
+            except Exception as cv_error:
+                # Method 4: Try with different encoding
+                try:
+                    # Sometimes encoding the path differently helps
+                    encoded_path = image_path.encode('utf-8').decode('utf-8')
+                    image = Image.open(encoded_path).convert("RGB")
+                    return image
+                except Exception as encoding_error:
+                    # Log the specific errors for debugging
+                    print(f"Failed to open {image_path}:")
+                    print(f"  PIL error: {pil_error}")
+                    print(f"  Pathlib error: {pathlib_error}")
+                    print(f"  OpenCV error: {cv_error}")
+                    print(f"  Encoding error: {encoding_error}")
+                    return None
+
+    return None
+
+
+def get_image_files_unicode_safe(folder):
+    """Get all image files in a folder with proper Unicode handling."""
+    extensions = ('.jpg', '.jpeg', '.png', '.heic', '.heif', '.webp', '.bmp', '.tiff', '.tif')
+    image_files = []
+
+    try:
+        # Use pathlib for better Unicode support
+        folder_path = Path(folder)
+
+        if not folder_path.exists():
+            print(f"Folder does not exist: {folder}")
+            return []
+
+        # Recursively find all image files
+        for ext in extensions:
+            # Use both cases for extensions
+            image_files.extend(folder_path.glob(f"**/*{ext}"))
+            image_files.extend(folder_path.glob(f"**/*{ext.upper()}"))
+
+        # Convert back to strings and remove duplicates
+        image_files = list(set([str(f) for f in image_files if f.is_file()]))
+
+        print(f"Found {len(image_files)} image files in {folder}")
+        return image_files
+
+    except Exception as e:
+        print(f"Error scanning folder {folder}: {e}")
+        # Fallback to original method
+        try:
+            return [os.path.join(folder, f) for f in os.listdir(folder)
+                    if os.path.isfile(os.path.join(folder, f)) and
+                    f.lower().endswith(extensions)]
+        except Exception as fallback_error:
+            print(f"Fallback method also failed: {fallback_error}")
+            return []
+
+
 def match_images(folder1, folder2, top_n=5):
     """
     Match images between two folders using ImageBind embeddings.
-    This version includes optimizations for speed.
+    This version includes Unicode support and optimizations for speed.
 
     Args:
         folder1: Path to first folder containing images
@@ -82,9 +185,9 @@ def match_images(folder1, folder2, top_n=5):
             normalize,
         ])
 
-        # OPTIMIZATION: Function to process images in batches
+        # OPTIMIZATION: Function to process images in batches with Unicode support
         def extract_features_batch(image_paths, batch_size=32):
-            """Process images in batches for faster inference"""
+            """Process images in batches for faster inference with Unicode support"""
             features = {}
 
             for i in range(0, len(image_paths), batch_size):
@@ -92,11 +195,14 @@ def match_images(folder1, folder2, top_n=5):
                 valid_images = []
                 valid_paths = []
 
-                # Preprocess all images in the batch
+                # Preprocess all images in the batch with safe image loading
                 for img_path in batch_paths:
                     try:
-                        # Load and preprocess image
-                        image = Image.open(img_path).convert("RGB")
+                        # Use safe image loading for Unicode support
+                        image = safe_image_open(img_path)
+
+                        if image is None:
+                            continue
 
                         # Skip small images
                         if image.size[0] < 10 or image.size[1] < 10:
@@ -109,7 +215,8 @@ def match_images(folder1, folder2, top_n=5):
                         valid_images.append(img_tensor)
                         valid_paths.append(img_path)
                     except Exception as e:
-                        pass  # Skip problematic images silently
+                        print(f"Batch processing error for {img_path}: {e}")
+                        continue
 
                 if not valid_images:
                     continue
@@ -145,11 +252,14 @@ def match_images(folder1, folder2, top_n=5):
 
             return features
 
-        # Function for sequential processing (fallback)
+        # Function for sequential processing (fallback) with Unicode support
         def extract_features(image_path):
             try:
-                # Load and preprocess image
-                image = Image.open(image_path).convert("RGB")
+                # Use safe image loading
+                image = safe_image_open(image_path)
+
+                if image is None:
+                    return None
 
                 # Check image validity
                 if image.size[0] < 10 or image.size[1] < 10:
@@ -171,6 +281,7 @@ def match_images(folder1, folder2, top_n=5):
                 return embeddings[ModalityType.VISION][0].cpu().numpy()
 
             except Exception as e:
+                print(f"Individual processing error for {image_path}: {e}")
                 return None
 
     except Exception as e:
@@ -187,7 +298,7 @@ def match_images(folder1, folder2, top_n=5):
         if device == "cuda":
             model = model.half()
 
-        # Function for batch processing with CLIP
+        # Function for batch processing with CLIP and Unicode support
         def extract_features_batch(image_paths, batch_size=64):
             features = {}
             for i in range(0, len(image_paths), batch_size):
@@ -197,7 +308,9 @@ def match_images(folder1, folder2, top_n=5):
 
                 for img_path in batch_paths:
                     try:
-                        image = Image.open(img_path).convert("RGB")
+                        image = safe_image_open(img_path)
+                        if image is None:
+                            continue
                         img_tensor = preprocess(image)
                         valid_images.append(img_tensor)
                         valid_paths.append(img_path)
@@ -224,10 +337,13 @@ def match_images(folder1, folder2, top_n=5):
 
             return features
 
-        # Sequential version for CLIP (fallback)
+        # Sequential version for CLIP (fallback) with Unicode support
         def extract_features(image_path):
             try:
-                image = Image.open(image_path).convert("RGB")
+                image = safe_image_open(image_path)
+                if image is None:
+                    return None
+
                 image_tensor = preprocess(image).unsqueeze(0).to(device)
 
                 if device == "cuda":
@@ -240,9 +356,9 @@ def match_images(folder1, folder2, top_n=5):
             except Exception:
                 return None
 
-    # Get image files
-    img_files1 = get_image_files(folder1)
-    img_files2 = get_image_files(folder2)
+    # Get image files with Unicode support
+    img_files1 = get_image_files_unicode_safe(folder1)
+    img_files2 = get_image_files_unicode_safe(folder2)
 
     print(f"Processing {len(img_files1)} images from folder 1")
     print(f"Processing {len(img_files2)} images from folder 2")
@@ -312,14 +428,6 @@ def match_images(folder1, folder2, top_n=5):
         "processing_time": processing_time,
         "memory_usage": memory_used
     }
-
-
-def get_image_files(folder):
-    """Get all image files in a folder."""
-    extensions = ('.jpg', '.jpeg', '.png', '.heic', '.heif', '.webp')
-    return [os.path.join(folder, f) for f in os.listdir(folder)
-            if os.path.isfile(os.path.join(folder, f)) and
-            f.lower().endswith(extensions)]
 
 
 def get_memory_usage():
